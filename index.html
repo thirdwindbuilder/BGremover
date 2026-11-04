@@ -41,6 +41,7 @@ body { background: var(--bg); color: var(--fg); font: 16px/1.45 var(--body) }
 #stage { display: block; touch-action: pan-y; cursor: ew-resize;
   background: repeating-conic-gradient(var(--check-a) 0 25%, var(--check-b) 0 50%) 0 0 / 22px 22px }
 #stage.brush { touch-action: none; cursor: none }
+#stage.select { touch-action: none; cursor: crosshair }
 .busy { position: absolute; inset: 22px 0 0; display: grid; place-items: center; text-align: center; padding: 16px;
   background: color-mix(in srgb, var(--mat) 78%, transparent); color: #fff; font-weight: 700 }
 .side { display: grid; gap: 16px; min-width: 0 }
@@ -119,6 +120,14 @@ kbd { font: .85em var(--mono); border: 1px solid var(--line); border-bottom-widt
         <button id="t-compare" aria-pressed="true">Compare</button>
         <button id="t-erase" aria-pressed="false">Erase</button>
         <button id="t-restore" aria-pressed="false">Restore</button>
+        <button id="t-select" aria-pressed="false">Select</button>
+      </div>
+      <div id="select-box" hidden style="display:grid;gap:8px">
+        <p class="hint">Drag a box around one piece — a sofa, chair, lamp — and only that piece is kept. Then tap anything it missed, or switch to <b>Tap removes</b> and tap what it wrongly kept. The first use downloads 45 MB.</p>
+        <div class="seg" role="group" aria-label="What a tap does">
+          <button id="sm-add" aria-pressed="true">Tap adds</button>
+          <button id="sm-remove" aria-pressed="false">Tap removes</button>
+        </div>
       </div>
       <div class="slider" id="split-box">
         <label for="split">Show original <output id="split-out"></output></label>
@@ -129,7 +138,7 @@ kbd { font: .85em var(--mono); border: 1px solid var(--line); border-bottom-widt
         <input type="range" id="brush" min="1" max="20" step="0.5" value="4">
       </div>
       <div class="row2">
-        <button id="undo" disabled>Undo stroke</button>
+        <button id="undo" disabled>Undo</button>
         <button id="reset" disabled>Clear strokes</button>
       </div>
     </div>
@@ -224,7 +233,7 @@ function setSource(canvas, label) {
   const pw = Math.max(1, Math.round(src.width * ps)), ph = Math.max(1, Math.round(src.height * ps));
   stage.width = pw; stage.height = ph; cutCv = newCanvas(pw, ph); previewCv = newCanvas(pw, ph);
   const p = previewCv.getContext('2d'); p.imageSmoothingQuality = 'high'; p.drawImage(src, 0, 0, pw, ph);
-  edits = new Int8Array(W * H); undoStack = []; syncEditButtons(); fit();
+  edits = new Int8Array(W * H); undoStack = []; sel = null; drag = null; syncEditButtons(); fit();
 }
 
 async function openFile(file, label) {
@@ -256,10 +265,10 @@ async function cut(id) {
     say('Working on your photo…');
     await removeBackground(id);
     if (id !== runId) return;
-    split = 0; setSplitUI(); updateAlpha();
+    sel = null; split = 0; setSplitUI(); updateAlpha();
     let total = 0; for (let i = 0; i < raw.length; i++) total += raw[i];
     if (total / raw.length < 0.01) say('No clear subject was found. Use Restore to paint back what you want to keep, or try a photo with one main subject.', true);
-    else say(`Done${useBig ? ' (best quality)' : ''}. ${sizeNote}Use Compare to check it, or Erase and Restore to fix any edges.`);
+    else say(`Done${useBig ? ' (best quality)' : ''}. ${sizeNote}Wrong piece, or part of the room left in? Choose Select and drag a box around the piece you want.`);
   } catch (e) {
     console.error(e);
     if (id !== runId) return;
@@ -291,27 +300,31 @@ async function getSession() {
 /* Best quality: the full U-2-Net (8-bit, 44 MB), stored as four base64 text parts. Benchmarked on 300 ECSSD photos it
    misses less often than the small model (2.3% vs 3.3% failed cutouts). */
 let bigSession = null, useBig = false;
-const BIG_PARTS = ['u2net-q8.part00.txt', 'u2net-q8.part01.txt', 'u2net-q8.part02.txt', 'u2net-q8.part03.txt'];
-async function getBigSession() {
-  if (bigSession) return bigSession;
-  await getSession();
+/* Downloads a model stored as base64 text parts (the artifact host serves text, not raw binary) and checks its size. */
+async function loadParts(names, bytesExpected, label, progress) {
   const base = new URL('assets/', document.baseURI).href, parts = [];
-  let got = 0; const total = 4 * 14724344, MODEL_BYTES = 44173029;
-  for (const p of BIG_PARTS) {
+  for (const p of names) {
     const res = await fetch(base + p);
-    if (!res.ok || !res.body) throw new Error('big fetch ' + res.status);
+    if (!res.ok || !res.body) throw new Error(label + ' fetch ' + res.status);
     const reader = res.body.getReader(), chunks = []; let len = 0;
     for (;;) {
       const { done, value } = await reader.read(); if (done) break;
-      chunks.push(value); len += value.length; got += value.length;
-      busy(`Downloading the best-quality model… ${Math.min(99, Math.round(got / total * 100))}%`);
+      chunks.push(value); len += value.length; progress.got += value.length;
+      busy(`Downloading the ${label}… ${Math.min(99, Math.round(progress.got / progress.total * 100))}%`);
     }
     const text = new Uint8Array(len); let o = 0; for (const c of chunks) { text.set(c, o); o += c.length; }
     parts.push(Uint8Array.from(atob(new TextDecoder().decode(text).trim()), ch => ch.charCodeAt(0)));
   }
   const size = parts.reduce((a, b) => a + b.length, 0);
-  if (size !== MODEL_BYTES) throw new Error('big size ' + size);
+  if (size !== bytesExpected) throw new Error(label + ' size ' + size);
   const bytes = new Uint8Array(size); let o = 0; for (const c of parts) { bytes.set(c, o); o += c.length; }
+  return bytes;
+}
+const BIG_PARTS = ['u2net-q8.part00.txt', 'u2net-q8.part01.txt', 'u2net-q8.part02.txt', 'u2net-q8.part03.txt'];
+async function getBigSession() {
+  if (bigSession) return bigSession;
+  await getSession();
+  const bytes = await loadParts(BIG_PARTS, 44173029, 'best-quality model', { got: 0, total: 4 * 14724344 });
   busy('Starting the best-quality model…'); await nextPaint();
   try { bigSession = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] }); }
   catch (e) { throw new Error('big init ' + e.message); }
@@ -370,6 +383,69 @@ async function removeBackground(id) {
   const col = flatten(W, H), gray = new Float32Array(W * H);
   for (let i = 0; i < gray.length; i++) gray[i] = (col[i * 4] * .299 + col[i * 4 + 1] * .587 + col[i * 4 + 2] * .114) / 255;
   raw = guidedFilter(gray, p, W, H, Math.max(3, Math.round(Math.max(W, H) / 90)), 0.002);
+}
+
+/* ---------- Select: MobileSAM (Apache-2.0). Drag a box around one piece; taps add or remove parts. ----------
+   Benchmarked on 300 furniture pieces in real room photos (COCO): with a roughly drawn box it keeps the right
+   piece far more often than the automatic cutout (overlap 0.66 vs 0.29-0.32). */
+const SAM_ENC = ['msam-enc.part00.txt', 'msam-enc.part01.txt', 'msam-enc.part02.txt'], SAM_DEC = ['msam-dec.part00.txt', 'msam-dec.part01.txt'];
+let samEnc = null, samDec = null, samEmb = null, samFor = null, sel = null, selMode = 'add', drag = null;
+async function getSam() {
+  if (samEnc && samDec) return;
+  await getSession();
+  const progress = { got: 0, total: 3 * 12512420 + 2 * 11001160 };
+  const enc = await loadParts(SAM_ENC, 28152943, 'selection model', progress);
+  const dec = await loadParts(SAM_DEC, 16501737, 'selection model', progress);
+  busy('Starting the selection model…'); await nextPaint();
+  samDec = await ort.InferenceSession.create(dec, { executionProviders: ['wasm'] });
+  samEnc = await ort.InferenceSession.create(enc, { executionProviders: ['wasm'] });
+}
+async function samEmbed() {
+  if (samEmb && samFor === src) return samEmb;
+  await getSam();
+  busy('Studying the photo…'); await nextPaint();
+  const k = 1024 / Math.max(src.width, src.height), nw = Math.max(1, Math.round(src.width * k)), nh = Math.max(1, Math.round(src.height * k));
+  const c = newCanvas(nw, nh), x = c.getContext('2d', { willReadFrequently: true });
+  x.fillStyle = '#fff'; x.fillRect(0, 0, nw, nh); x.imageSmoothingQuality = 'high'; x.drawImage(src, 0, 0, nw, nh);
+  const px = x.getImageData(0, 0, nw, nh).data, n = 1024 * 1024, input = new Float32Array(3 * n);
+  const mean = [123.675, 116.28, 103.53], std = [58.395, 57.12, 57.375];
+  for (let y = 0; y < nh; y++) for (let xx = 0; xx < nw; xx++) {
+    const i = (y * nw + xx) * 4, o = y * 1024 + xx;
+    for (let ch = 0; ch < 3; ch++) input[ch * n + o] = (px[i + ch] - mean[ch]) / std[ch];
+  }
+  const out = await samEnc.run({ [samEnc.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, 1024, 1024]) });
+  samEmb = out[samEnc.outputNames[0]]; samFor = src;
+  return samEmb;
+}
+async function runSelect() {
+  const id = runId;
+  try {
+    const emb = await samEmbed();
+    if (id !== runId || !sel) return;
+    busy('Selecting…'); await nextPaint();
+    const k = 1024 / Math.max(W, H), pts = [], labs = [];
+    for (const p of sel.points) { pts.push(p.x * k, p.y * k); labs.push(p.add ? 1 : 0); }
+    if (sel.box) { const b = sel.box; pts.push(b.x0 * k, b.y0 * k, b.x1 * k, b.y1 * k); labs.push(2, 3); }
+    else { pts.push(0, 0); labs.push(-1); }
+    const T = (data, dims) => new ort.Tensor('float32', data, dims);
+    const out = await samDec.run({
+      image_embeddings: emb, point_coords: T(Float32Array.from(pts), [1, labs.length, 2]), point_labels: T(Float32Array.from(labs), [1, labs.length]),
+      mask_input: T(new Float32Array(256 * 256), [1, 1, 256, 256]), has_mask_input: T(new Float32Array(1), [1]), orig_im_size: T(Float32Array.from([H, W]), [2]),
+    });
+    if (id !== runId) return;
+    const m = out[samDec.outputNames[0]].data, p = new Float32Array(W * H);
+    for (let i = 0; i < p.length; i++) p[i] = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, m[i]))));
+    const col = flatten(W, H), gray = new Float32Array(W * H);
+    for (let i = 0; i < gray.length; i++) gray[i] = (col[i * 4] * .299 + col[i * 4 + 1] * .587 + col[i * 4 + 2] * .114) / 255;
+    raw = guidedFilter(gray, p, W, H, Math.max(2, Math.round(Math.max(W, H) / 200)), 0.001);
+    edits.fill(0); split = 0; setSplitUI(); updateAlpha();
+    let total = 0; for (let i = 0; i < raw.length; i++) total += raw[i] > .5;
+    say(total < raw.length * 0.002 ? 'Nothing was selected there. Try a box that fits snugly around the piece.' :
+      'Selected. Tap to add anything it missed; switch to Tap removes for anything it wrongly kept. Undo steps back.', total < raw.length * 0.002);
+  } catch (e) {
+    console.error(e);
+    if (id === runId) say('The selection model could not be loaded. Check your connection and try Select again.', true);
+  } finally { if (id === runId) busy(''); }
 }
 
 /* Box mean over a (2r+1) window, shrinking at the borders. */
@@ -442,7 +518,21 @@ function render() {
       sctx.beginPath(); sctx.arc(cx, cy, rad, 0, 7); sctx.fill();
       sctx.fillStyle = '#17281f'; sctx.font = `700 ${rad}px sans-serif`; sctx.textAlign = 'center'; sctx.textBaseline = 'middle'; sctx.fillText('↔', cx, cy); }
   }
-  if (hover && tool !== 'compare') {
+  if (tool === 'select') {
+    const f = stage.width / W, lw = Math.max(2, w / 500);
+    const boxes = [sel?.box, drag].filter(Boolean);
+    for (const b of boxes) {
+      const x0 = Math.min(b.x0, b.x1) * f, y0 = Math.min(b.y0, b.y1) * f, bw = Math.abs(b.x1 - b.x0) * f, bh = Math.abs(b.y1 - b.y0) * f;
+      sctx.lineWidth = lw; sctx.strokeStyle = '#000'; sctx.strokeRect(x0, y0, bw, bh);
+      sctx.setLineDash([lw * 4, lw * 3]); sctx.strokeStyle = '#fff'; sctx.strokeRect(x0, y0, bw, bh); sctx.setLineDash([]);
+    }
+    for (const p of sel?.points || []) {
+      const r = lw * 5; sctx.beginPath(); sctx.arc(p.x * f, p.y * f, r, 0, 7);
+      sctx.fillStyle = p.add ? '#1f9d55' : '#d13b2a'; sctx.fill(); sctx.lineWidth = lw * .8; sctx.strokeStyle = '#fff'; sctx.stroke();
+      sctx.fillStyle = '#fff'; sctx.font = `700 ${r * 1.6}px sans-serif`; sctx.textAlign = 'center'; sctx.textBaseline = 'middle'; sctx.fillText(p.add ? '+' : '−', p.x * f, p.y * f + r * .05);
+    }
+  }
+  if (hover && (tool === 'erase' || tool === 'restore')) {
     const r = brushRadius() * stage.width / W;
     sctx.beginPath(); sctx.arc(hover.x * stage.width / W, hover.y * stage.width / W, r, 0, 7);
     sctx.lineWidth = Math.max(1.5, w / 700); sctx.strokeStyle = '#000'; sctx.stroke();
@@ -470,14 +560,19 @@ new ResizeObserver(fit).observe($('mat'));
 const brushRadius = () => +$('brush').value / 100 * Math.max(W, H) / 2;
 function setTool(t) {
   tool = t;
-  for (const k of ['compare', 'erase', 'restore']) $('t-' + k).setAttribute('aria-pressed', k === t);
-  $('split-box').hidden = t !== 'compare'; $('brush-box').hidden = t === 'compare';
-  stage.classList.toggle('brush', t !== 'compare');
+  for (const k of ['compare', 'erase', 'restore', 'select']) $('t-' + k).setAttribute('aria-pressed', k === t);
+  $('split-box').hidden = t !== 'compare'; $('brush-box').hidden = t !== 'erase' && t !== 'restore'; $('select-box').hidden = t !== 'select';
+  stage.classList.toggle('brush', t === 'erase' || t === 'restore'); stage.classList.toggle('select', t === 'select');
+  if (t === 'select') say(sel ? 'Tap to add or remove parts, or drag a new box.' : 'Drag a box around the piece you want to keep.');
   split = t === 'compare' ? (split === 0 ? 0.5 : split) : 0;
   setSplitUI(); render();
 }
 function setSplitUI() { $('split').value = Math.round(split * 100); $('split-out').textContent = Math.round(split * 100) + '%'; }
 function syncEditButtons() { $('undo').disabled = !undoStack.length; $('reset').disabled = !undoStack.length; }
+function pushUndo() {
+  undoStack.push({ edits: edits.slice(), raw: raw.slice(), sel: sel && { box: sel.box && { ...sel.box }, points: sel.points.map(p => ({ ...p })) } });
+  if (undoStack.length > 15) undoStack.shift(); syncEditButtons();
+}
 
 function paintLine(a, b, val) {
   const r = brushRadius(), dist = Math.hypot(b.x - a.x, b.y - a.y), steps = Math.max(1, Math.ceil(dist / Math.max(1, r / 3)));
@@ -500,26 +595,44 @@ stage.addEventListener('pointerdown', e => {
   stage.setPointerCapture(e.pointerId); dragging = true;
   const p = toMask(e);
   if (tool === 'compare') { split = Math.min(1, Math.max(0, p.f)); setSplitUI(); render(); return; }
-  undoStack.push(edits.slice()); if (undoStack.length > 20) undoStack.shift(); syncEditButtons();
+  if (tool === 'select') { drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y }; return; }
+  pushUndo();
   last = p; hover = p; paintLine(p, p, tool === 'erase' ? 1 : 2); queue(updateAlpha);
 });
 stage.addEventListener('pointermove', e => {
   if (!src) return;
   const p = toMask(e);
   if (tool === 'compare') { if (dragging) { split = Math.min(1, Math.max(0, p.f)); setSplitUI(); queue(render); } return; }
+  if (tool === 'select') { if (dragging && drag) { drag.x1 = p.x; drag.y1 = p.y; queue(render); } return; }
   hover = p;
   if (dragging && last) { paintLine(last, p, tool === 'erase' ? 1 : 2); last = p; queue(updateAlpha); } else queue(render);
 });
-const endStroke = () => { dragging = false; last = null; };
-stage.addEventListener('pointerup', endStroke); stage.addEventListener('pointercancel', endStroke);
+const endStroke = () => { dragging = false; last = null; if (drag) { drag = null; queue(render); } };
+stage.addEventListener('pointerup', e => {
+  if (tool === 'select' && drag && dragging) {
+    const b = drag, minPx = 8 * W / stage.getBoundingClientRect().width;
+    pushUndo();
+    if (Math.abs(b.x1 - b.x0) > minPx && Math.abs(b.y1 - b.y0) > minPx) {
+      const clamp = (v, m) => Math.min(m - 1, Math.max(0, v));
+      sel = { box: { x0: clamp(Math.min(b.x0, b.x1), W), y0: clamp(Math.min(b.y0, b.y1), H), x1: clamp(Math.max(b.x0, b.x1), W), y1: clamp(Math.max(b.y0, b.y1), H) }, points: [] };
+    } else {
+      sel = sel || { box: null, points: [] };
+      sel.points.push({ x: b.x1, y: b.y1, add: selMode === 'add' && !e.shiftKey && !e.altKey });
+    }
+    dragging = false; drag = null; render(); runSelect(); return;
+  }
+  endStroke();
+});
+stage.addEventListener('pointercancel', endStroke);
 stage.addEventListener('pointerleave', () => { hover = null; if (src) queue(render); });
 
-for (const t of ['compare', 'erase', 'restore']) $('t-' + t).onclick = () => setTool(t);
+for (const t of ['compare', 'erase', 'restore', 'select']) $('t-' + t).onclick = () => setTool(t);
+for (const m of ['add', 'remove']) $('sm-' + m).onclick = () => { selMode = m; $('sm-add').setAttribute('aria-pressed', m === 'add'); $('sm-remove').setAttribute('aria-pressed', m === 'remove'); };
 $('split').oninput = e => { split = e.target.value / 100; setSplitUI(); render(); };
 $('brush').oninput = e => { $('brush-out').textContent = e.target.value + '%'; };
 $('brush-out').textContent = $('brush').value + '%';
 $('cutoff').oninput = $('soft').oninput = () => queue(updateAlpha);
-$('undo').onclick = () => { if (undoStack.length) { edits = undoStack.pop(); syncEditButtons(); updateAlpha(); } };
+$('undo').onclick = () => { if (undoStack.length) { const u = undoStack.pop(); edits = u.edits; raw = u.raw; sel = u.sel; syncEditButtons(); updateAlpha(); } };
 $('reset').onclick = () => { undoStack = []; edits.fill(0); syncEditButtons(); updateAlpha(); };
 
 function setBg(val, el) {

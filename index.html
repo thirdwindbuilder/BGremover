@@ -124,9 +124,10 @@ kbd { font: .85em var(--mono); border: 1px solid var(--line); border-bottom-widt
         <button id="t-select" aria-pressed="false">Select</button>
       </div>
       <div id="select-box" hidden style="display:grid;gap:8px">
-        <p class="hint">Drag a box around one piece — a sofa, chair, lamp — and only that piece is kept. Then tap anything it missed, or switch to <b>Tap removes</b> and tap what it wrongly kept. The first use downloads 45 MB.</p>
+        <p class="hint">Tap the item you want and only that item is kept. To keep several, switch to <b>Tap adds</b>; to drop one, <b>Tap removes</b>. You can also drag a box around an item.</p>
         <div class="seg" role="group" aria-label="What a tap does">
-          <button id="sm-add" aria-pressed="true">Tap adds</button>
+          <button id="sm-pick" aria-pressed="true">Tap picks</button>
+          <button id="sm-add" aria-pressed="false">Tap adds</button>
           <button id="sm-remove" aria-pressed="false">Tap removes</button>
         </div>
       </div>
@@ -237,7 +238,7 @@ function setSource(canvas, label) {
   const pw = Math.max(1, Math.round(src.width * ps)), ph = Math.max(1, Math.round(src.height * ps));
   stage.width = pw; stage.height = ph; cutCv = newCanvas(pw, ph); previewCv = newCanvas(pw, ph);
   const p = previewCv.getContext('2d'); p.imageSmoothingQuality = 'high'; p.drawImage(src, 0, 0, pw, ph);
-  edits = new Int8Array(W * H); cap = new Float32Array(W * H).fill(1); undoStack = []; gap = null; sel = null; drag = null; modelRaw = null; bdAlpha = null; syncEditButtons(); fit();
+  edits = new Int8Array(W * H); cap = new Float32Array(W * H).fill(1); undoStack = []; gap = null; sel = null; selRaw = null; drag = null; modelRaw = null; bdAlpha = null; syncEditButtons(); fit();
 }
 
 async function openFile(file, label) {
@@ -283,7 +284,7 @@ async function cut(id) {
     busy('Checking the background…'); await nextPaint();
     computeBackdrop(); if (bdAlpha) raw = bdAlpha.slice();
     busy('Looking for see-through gaps…'); await nextPaint(); computeGaps();
-    sel = null; split = 0; setSplitUI(); updateAlpha();
+    sel = null; selRaw = null; split = 0; setSplitUI(); updateAlpha();
     let total = 0; for (let i = 0; i < raw.length; i++) total += raw[i];
     if (total / raw.length < 0.01) say('No clear subject was found. Use Restore to paint back what you want to keep, or try a photo with one main subject.', true);
     else say(`Done${useBig ? ' (best quality)' : ''}. ${bdAlpha ? 'Flat background removed by colour. ' : ''}${gap ? gapInfo + ' ' : ''}${sizeNote}Wrong piece, or part of the room left in? Choose Select and drag a box around the piece you want.`);
@@ -406,14 +407,14 @@ async function removeBackground(id) {
 /* ---------- Select: MobileSAM (Apache-2.0). Drag a box around one piece; taps add or remove parts. ----------
    Benchmarked on 300 furniture pieces in real room photos (COCO): with a roughly drawn box it keeps the right
    piece far more often than the automatic cutout (overlap 0.66 vs 0.29-0.32). */
-const SAM_ENC = ['msam-enc.part00.txt', 'msam-enc.part01.txt', 'msam-enc.part02.txt'], SAM_DEC = ['msam-dec.part00.txt', 'msam-dec.part01.txt'];
-let samEnc = null, samDec = null, samEmb = null, samFor = null, sel = null, selMode = 'add', drag = null;
+const SAM_ENC = ['msam-enc.part00.txt', 'msam-enc.part01.txt', 'msam-enc.part02.txt'], SAM_DEC = ['msam-dec2.part00.txt', 'msam-dec2.part01.txt'];  // decoder with its 4 candidate masks + scores exposed
+let samEnc = null, samDec = null, samEmb = null, samFor = null, sel = null, selMode = 'pick', drag = null, selRaw = null;
 async function getSam() {
   if (samEnc && samDec) return;
   await getSession();
-  const progress = { got: 0, total: 3 * 12512420 + 2 * 11001160 };
+  const progress = { got: 0, total: 3 * 12512420 + 11001216 + 11001212 };
   const enc = await loadParts(SAM_ENC, 28152943, 'selection model', progress);
-  const dec = await loadParts(SAM_DEC, 16501737, 'selection model', progress);
+  const dec = await loadParts(SAM_DEC, 16501819, 'selection model', progress);
   busy('Starting the selection model…'); await nextPaint();
   samDec = await ort.InferenceSession.create(dec, { executionProviders: ['wasm'] });
   samEnc = await ort.InferenceSession.create(enc, { executionProviders: ['wasm'] });
@@ -435,32 +436,66 @@ async function samEmbed() {
   samEmb = out[samEnc.outputNames[0]]; samFor = src;
   return samEmb;
 }
-async function runSelect() {
+function edgeSnap(p) {  // snap a selection's soft edge to edges in the photo
+  const col = flatten(W, H), gray = new Float32Array(W * H);
+  for (let i = 0; i < gray.length; i++) gray[i] = (col[i * 4] * .299 + col[i * 4 + 1] * .587 + col[i * 4 + 2] * .114) / 255;
+  return guidedFilter(gray, p, W, H, Math.max(2, Math.round(Math.max(W, H) / 200)), 0.001);
+}
+const T = (data, dims) => new ort.Tensor('float32', data, dims);
+function samInputs(emb, pts, labs) {
+  return { image_embeddings: emb, point_coords: T(Float32Array.from(pts), [1, labs.length, 2]), point_labels: T(Float32Array.from(labs), [1, labs.length]),
+    mask_input: T(new Float32Array(256 * 256), [1, 1, 256, 256]), has_mask_input: T(new Float32Array(1), [1]), orig_im_size: T(Float32Array.from([H, W]), [2]) };
+}
+/* What is under a tap. On a flat background (already removed by colour) it is simply the island under the finger:
+   instant and exact. Otherwise SAM proposes three nested candidates (part, bigger part, whole); the largest one it is
+   still confident about is taken. Tested: boards 0.89 overlap with islands; furniture in rooms 0.56 vs 0.51 before. */
+async function elementAt(x, y) {
+  const i0 = Math.min(H - 1, Math.max(0, Math.round(y))) * W + Math.min(W - 1, Math.max(0, Math.round(x)));
+  if (bdAlpha && bdAlpha[i0] > .5) {
+    const m = new Float32Array(W * H), seen = new Uint8Array(W * H), stack = new Int32Array(W * H); let sp = 0; stack[sp++] = i0; seen[i0] = 1;
+    while (sp) { const q = stack[--sp], qx = q % W; m[q] = bdAlpha[q];
+      for (const r of [qx > 0 ? q - 1 : -1, qx < W - 1 ? q + 1 : -1, q - W, q + W]) {
+        if (r < 0 || r >= W * H || seen[r]) continue; seen[r] = 1;
+        if (bdAlpha[r] > .5) stack[sp++] = r; else m[r] = bdAlpha[r];  // soft rim
+      } }
+    return m;
+  }
+  const emb = await samEmbed(); busy('Selecting…'); await nextPaint();
+  const k = 1024 / Math.max(W, H), out = await samDec.run(samInputs(emb, [x * k, y * k, 0, 0], [1, -1]));
+  const lr = out[samDec.outputNames[3]].data, iou = out[samDec.outputNames[4]].data;  // [1,4,256,256], [1,4]
+  const nh = Math.round(H * k / 4), nw = Math.round(W * k / 4), area = j => { let n = 0; for (let yy = 0; yy < nh; yy++) for (let xx = 0; xx < nw; xx++) n += lr[j * 65536 + yy * 256 + xx] > 0; return n; };
+  const top = Math.max(iou[1], iou[2], iou[3]); let best = -1, bestA = -1;
+  for (let j = 1; j <= 3; j++) if (iou[j] >= top - .10) { const A = area(j); if (A > bestA) { bestA = A; best = j; } }
+  const p = new Float32Array(W * H), o = best * 65536;
+  for (let yy = 0; yy < H; yy++) for (let xx = 0; xx < W; xx++) {  // bilinear from the 256 grid (in the 1024 frame)
+    const u = Math.min(255, Math.max(0, ((xx + .5) * k) / 4 - .5)), v = Math.min(255, Math.max(0, ((yy + .5) * k) / 4 - .5)), u0 = u | 0, v0 = v | 0, u1 = Math.min(255, u0 + 1), v1 = Math.min(255, v0 + 1), fu = u - u0, fv = v - v0;
+    const l = (lr[o + v0 * 256 + u0] * (1 - fu) + lr[o + v0 * 256 + u1] * fu) * (1 - fv) + (lr[o + v1 * 256 + u0] * (1 - fu) + lr[o + v1 * 256 + u1] * fu) * fv;
+    p[yy * W + xx] = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, l))));
+  }
+  return edgeSnap(p);
+}
+async function boxAt(b) {
+  const emb = await samEmbed(); busy('Selecting…'); await nextPaint();
+  const k = 1024 / Math.max(W, H), out = await samDec.run(samInputs(emb, [b.x0 * k, b.y0 * k, b.x1 * k, b.y1 * k], [2, 3]));
+  const m = out[samDec.outputNames[0]].data, p = new Float32Array(W * H);
+  for (let i = 0; i < p.length; i++) p[i] = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, m[i]))));
+  return edgeSnap(p);
+}
+async function runSelect(action) {  // action: {box} or {x, y, mode}
   const id = runId;
   try {
-    const emb = await samEmbed();
-    if (id !== runId || !sel) return;
-    busy('Selecting…'); await nextPaint();
-    const k = 1024 / Math.max(W, H), pts = [], labs = [];
-    for (const p of sel.points) { pts.push(p.x * k, p.y * k); labs.push(p.add ? 1 : 0); }
-    if (sel.box) { const b = sel.box; pts.push(b.x0 * k, b.y0 * k, b.x1 * k, b.y1 * k); labs.push(2, 3); }
-    else { pts.push(0, 0); labs.push(-1); }
-    const T = (data, dims) => new ort.Tensor('float32', data, dims);
-    const out = await samDec.run({
-      image_embeddings: emb, point_coords: T(Float32Array.from(pts), [1, labs.length, 2]), point_labels: T(Float32Array.from(labs), [1, labs.length]),
-      mask_input: T(new Float32Array(256 * 256), [1, 1, 256, 256]), has_mask_input: T(new Float32Array(1), [1]), orig_im_size: T(Float32Array.from([H, W]), [2]),
-    });
+    const m = action.box ? await boxAt(action.box) : await elementAt(action.x, action.y);
     if (id !== runId) return;
-    const m = out[samDec.outputNames[0]].data, p = new Float32Array(W * H);
-    for (let i = 0; i < p.length; i++) p[i] = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, m[i]))));
-    const col = flatten(W, H), gray = new Float32Array(W * H);
-    for (let i = 0; i < gray.length; i++) gray[i] = (col[i * 4] * .299 + col[i * 4 + 1] * .587 + col[i * 4 + 2] * .114) / 255;
-    raw = guidedFilter(gray, p, W, H, Math.max(2, Math.round(Math.max(W, H) / 200)), 0.001);
+    const mode = action.box || !selRaw ? 'pick' : action.mode;
+    if (mode === 'pick') selRaw = m;
+    else if (mode === 'add') for (let i = 0; i < m.length; i++) selRaw[i] = Math.max(selRaw[i], m[i]);
+    else for (let i = 0; i < m.length; i++) selRaw[i] = Math.min(selRaw[i], 1 - m[i]);
+    raw = selRaw.slice();
     if (bdAlpha) for (let i = 0; i < raw.length; i++) raw[i] = Math.min(raw[i], bdAlpha[i]);
     edits.fill(0); computeGaps(); split = 0; setSplitUI(); updateAlpha();
     let total = 0; for (let i = 0; i < raw.length; i++) total += raw[i] > .5;
-    say(total < raw.length * 0.002 ? 'Nothing was selected there. Try a box that fits snugly around the piece.' :
-      'Selected. Tap to add anything it missed; switch to Tap removes for anything it wrongly kept. Undo steps back.', total < raw.length * 0.002);
+    if (total < raw.length * 0.002) say('Nothing is selected. Tap right on the item, or drag a box around it.', true);
+    else say(mode === 'pick' ? 'Got it. Tap a different item to pick that instead, or switch to Tap adds to keep several.' : mode === 'add' ? 'Added.' : 'Removed.');
   } catch (e) {
     console.error(e);
     if (id === runId) say('The selection model could not be loaded. Check your connection and try Select again.', true);
@@ -771,14 +806,14 @@ function setTool(t) {
   const brushy = t === 'erase' || t === 'restore' || t === 'smart';
   $('split-box').hidden = t !== 'compare'; $('brush-box').hidden = !brushy; $('select-box').hidden = t !== 'select'; $('smart-box').hidden = t !== 'smart';
   stage.classList.toggle('brush', brushy); stage.classList.toggle('select', t === 'select');
-  if (t === 'select') say(sel ? 'Tap to add or remove parts, or drag a new box.' : 'Drag a box around the piece you want to keep.');
+  if (t === 'select') say('Tap the item you want to keep, or drag a box around it.');
   split = t === 'compare' ? (split === 0 ? 0.5 : split) : 0;
   setSplitUI(); render();
 }
 function setSplitUI() { $('split').value = Math.round(split * 100); $('split-out').textContent = Math.round(split * 100) + '%'; }
 function syncEditButtons() { $('undo').disabled = !undoStack.length; $('reset').disabled = !undoStack.length; }
 function pushUndo() {
-  undoStack.push({ edits: edits.slice(), raw: raw.slice(), gap, cap: cap.slice(), sel: sel && { box: sel.box && { ...sel.box }, points: sel.points.map(p => ({ ...p })) } });
+  undoStack.push({ edits: edits.slice(), raw: raw.slice(), gap, cap: cap.slice(), selRaw: selRaw && selRaw.slice(), sel: sel && { box: sel.box && { ...sel.box }, points: sel.points.map(p => ({ ...p })) } });
   if (undoStack.length > 15) undoStack.shift(); syncEditButtons();
 }
 
@@ -872,15 +907,17 @@ const endStroke = () => { dragging = false; last = null; if (drag) { drag = null
 stage.addEventListener('pointerup', e => {
   if (tool === 'select' && drag && dragging) {
     const b = drag, minPx = 8 * W / stage.getBoundingClientRect().width;
-    pushUndo();
+    pushUndo(); let action;
     if (Math.abs(b.x1 - b.x0) > minPx && Math.abs(b.y1 - b.y0) > minPx) {
       const clamp = (v, m) => Math.min(m - 1, Math.max(0, v));
-      sel = { box: { x0: clamp(Math.min(b.x0, b.x1), W), y0: clamp(Math.min(b.y0, b.y1), H), x1: clamp(Math.max(b.x0, b.x1), W), y1: clamp(Math.max(b.y0, b.y1), H) }, points: [] };
+      const box = { x0: clamp(Math.min(b.x0, b.x1), W), y0: clamp(Math.min(b.y0, b.y1), H), x1: clamp(Math.max(b.x0, b.x1), W), y1: clamp(Math.max(b.y0, b.y1), H) };
+      sel = { box, points: [] }; action = { box };
     } else {
-      sel = sel || { box: null, points: [] };
-      sel.points.push({ x: b.x1, y: b.y1, add: selMode === 'add' && !e.shiftKey && !e.altKey });
+      const mode = e.altKey ? 'remove' : e.shiftKey ? 'add' : selMode;
+      if (mode === 'pick' || !sel) sel = { box: null, points: [] };
+      sel.points.push({ x: b.x1, y: b.y1, add: mode !== 'remove' }); action = { x: b.x1, y: b.y1, mode };
     }
-    dragging = false; drag = null; render(); runSelect(); return;
+    dragging = false; drag = null; render(); runSelect(action); return;
   }
   endStroke();
 });
@@ -889,12 +926,12 @@ stage.addEventListener('pointerleave', () => { hover = null; if (src) queue(rend
 
 for (const t of ['compare', 'erase', 'smart', 'restore', 'select']) $('t-' + t).onclick = () => setTool(t);
 $('sens').oninput = e => { $('sens-out').textContent = e.target.value; }; $('sens-out').textContent = $('sens').value;
-for (const m of ['add', 'remove']) $('sm-' + m).onclick = () => { selMode = m; $('sm-add').setAttribute('aria-pressed', m === 'add'); $('sm-remove').setAttribute('aria-pressed', m === 'remove'); };
+for (const m of ['pick', 'add', 'remove']) $('sm-' + m).onclick = () => { selMode = m; for (const k of ['pick', 'add', 'remove']) $('sm-' + k).setAttribute('aria-pressed', k === m); };
 $('split').oninput = e => { split = e.target.value / 100; setSplitUI(); render(); };
 $('brush').oninput = e => { $('brush-out').textContent = e.target.value + '%'; };
 $('brush-out').textContent = $('brush').value + '%';
 $('cutoff').oninput = () => queue(updateAlpha);
-$('undo').onclick = () => { if (undoStack.length) { const u = undoStack.pop(); edits = u.edits; raw = u.raw; sel = u.sel; gap = u.gap; cap = u.cap; syncEditButtons(); updateAlpha(); } };
+$('undo').onclick = () => { if (undoStack.length) { const u = undoStack.pop(); edits = u.edits; raw = u.raw; sel = u.sel; gap = u.gap; cap = u.cap; selRaw = u.selRaw; syncEditButtons(); updateAlpha(); } };
 $('reset').onclick = () => { undoStack = []; edits.fill(0); cap.fill(1); syncEditButtons(); updateAlpha(); };
 
 function setBg(val, el) {

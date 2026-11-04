@@ -116,9 +116,10 @@ kbd { font: .85em var(--mono); border: 1px solid var(--line); border-bottom-widt
 
     <div class="group">
       <span class="label">Touch up</span>
-      <div class="seg" role="group" aria-label="Tool">
+      <div class="seg" role="group" aria-label="Tool" style="grid-auto-flow:row;grid-template-columns:repeat(3,1fr)">
         <button id="t-compare" aria-pressed="true">Compare</button>
         <button id="t-erase" aria-pressed="false">Erase</button>
+        <button id="t-smart" aria-pressed="false" title="Erases only what looks like background">Smart erase</button>
         <button id="t-restore" aria-pressed="false">Restore</button>
         <button id="t-select" aria-pressed="false">Select</button>
       </div>
@@ -136,6 +137,14 @@ kbd { font: .85em var(--mono); border: 1px solid var(--line); border-bottom-widt
       <div class="slider" id="brush-box" hidden>
         <label for="brush">Brush size <output id="brush-out"></output></label>
         <input type="range" id="brush" min="1" max="20" step="0.5" value="4">
+      </div>
+      <div id="smart-box" hidden style="display:grid;gap:6px">
+        <p class="hint">Brush over a hard-to-reach spot — between chair legs, inside a weave, around hair. Inside the brush it only removes what looks like the background. Start each stroke on the background: the colour under the <b>+</b> is what it removes.</p>
+        <div class="slider">
+          <label for="sens">Sensitivity <output id="sens-out"></output></label>
+          <input type="range" id="sens" min="1" max="100" value="40">
+          <div class="ends"><span>Only exact matches</span><span>Similar colours too</span></div>
+        </div>
       </div>
       <div class="row2">
         <button id="undo" disabled>Undo</button>
@@ -246,7 +255,7 @@ function setSource(canvas, label) {
   const pw = Math.max(1, Math.round(src.width * ps)), ph = Math.max(1, Math.round(src.height * ps));
   stage.width = pw; stage.height = ph; cutCv = newCanvas(pw, ph); previewCv = newCanvas(pw, ph);
   const p = previewCv.getContext('2d'); p.imageSmoothingQuality = 'high'; p.drawImage(src, 0, 0, pw, ph);
-  edits = new Int8Array(W * H); undoStack = []; gap = null; sel = null; drag = null; modelRaw = null; bdAlpha = null; $('fb-out').textContent = ''; syncEditButtons(); fit();
+  edits = new Int8Array(W * H); cap = new Float32Array(W * H).fill(1); undoStack = []; gap = null; sel = null; drag = null; modelRaw = null; bdAlpha = null; $('fb-out').textContent = ''; syncEditButtons(); fit();
 }
 
 async function openFile(file, label) {
@@ -707,7 +716,7 @@ function updateAlpha() {
   for (let i = 0; i < raw.length; i++) {
     let v;
     if (edits[i] === 1) v = 0; else if (edits[i] === 2) v = 1;
-    else { const t = Math.min(1, Math.max(0, (raw[i] - lo) * k)); v = t * t * (3 - 2 * t); if (gap) v = Math.min(v, gap[i]); }
+    else { const t = Math.min(1, Math.max(0, (raw[i] - lo) * k)); v = t * t * (3 - 2 * t); if (gap) v = Math.min(v, gap[i]); if (cap) v = Math.min(v, cap[i]); }
     a[i * 4 + 3] = v * 255;
   }
   alphaCv.getContext('2d').putImageData(alphaImg, 0, 0);
@@ -749,9 +758,10 @@ function render() {
       sctx.fillStyle = '#fff'; sctx.font = `700 ${r * 1.6}px sans-serif`; sctx.textAlign = 'center'; sctx.textBaseline = 'middle'; sctx.fillText(p.add ? '+' : '−', p.x * f, p.y * f + r * .05);
     }
   }
-  if (hover && (tool === 'erase' || tool === 'restore')) {
-    const r = brushRadius() * stage.width / W;
-    sctx.beginPath(); sctx.arc(hover.x * stage.width / W, hover.y * stage.width / W, r, 0, 7);
+  if (hover && (tool === 'erase' || tool === 'restore' || tool === 'smart')) {
+    const r = brushRadius() * stage.width / W, hx = hover.x * stage.width / W, hy = hover.y * stage.width / W;
+    sctx.beginPath(); sctx.arc(hx, hy, r, 0, 7);
+    if (tool === 'smart') { const c = Math.max(6, r * .25); sctx.moveTo(hx - c, hy); sctx.lineTo(hx + c, hy); sctx.moveTo(hx, hy - c); sctx.lineTo(hx, hy + c); }
     sctx.lineWidth = Math.max(1.5, w / 700); sctx.strokeStyle = '#000'; sctx.stroke();
     sctx.setLineDash([6, 6]); sctx.strokeStyle = '#fff'; sctx.stroke(); sctx.setLineDash([]);
   }
@@ -777,9 +787,10 @@ new ResizeObserver(fit).observe($('mat'));
 const brushRadius = () => +$('brush').value / 100 * Math.max(W, H) / 2;
 function setTool(t) {
   tool = t;
-  for (const k of ['compare', 'erase', 'restore', 'select']) $('t-' + k).setAttribute('aria-pressed', k === t);
-  $('split-box').hidden = t !== 'compare'; $('brush-box').hidden = t !== 'erase' && t !== 'restore'; $('select-box').hidden = t !== 'select';
-  stage.classList.toggle('brush', t === 'erase' || t === 'restore'); stage.classList.toggle('select', t === 'select');
+  for (const k of ['compare', 'erase', 'smart', 'restore', 'select']) $('t-' + k).setAttribute('aria-pressed', k === t);
+  const brushy = t === 'erase' || t === 'restore' || t === 'smart';
+  $('split-box').hidden = t !== 'compare'; $('brush-box').hidden = !brushy; $('select-box').hidden = t !== 'select'; $('smart-box').hidden = t !== 'smart';
+  stage.classList.toggle('brush', brushy); stage.classList.toggle('select', t === 'select');
   if (t === 'select') say(sel ? 'Tap to add or remove parts, or drag a new box.' : 'Drag a box around the piece you want to keep.');
   split = t === 'compare' ? (split === 0 ? 0.5 : split) : 0;
   setSplitUI(); render();
@@ -787,7 +798,7 @@ function setTool(t) {
 function setSplitUI() { $('split').value = Math.round(split * 100); $('split-out').textContent = Math.round(split * 100) + '%'; }
 function syncEditButtons() { $('undo').disabled = !undoStack.length; $('reset').disabled = !undoStack.length; }
 function pushUndo() {
-  undoStack.push({ edits: edits.slice(), raw: raw.slice(), gap, sel: sel && { box: sel.box && { ...sel.box }, points: sel.points.map(p => ({ ...p })) } });
+  undoStack.push({ edits: edits.slice(), raw: raw.slice(), gap, cap: cap.slice(), sel: sel && { box: sel.box && { ...sel.box }, points: sel.points.map(p => ({ ...p })) } });
   if (undoStack.length > 15) undoStack.shift(); syncEditButtons();
 }
 
@@ -799,6 +810,57 @@ function paintLine(a, b, val) {
     const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(W - 1, Math.ceil(cx + r));
     for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++)
       if ((x - cx) ** 2 + (y - cy) ** 2 <= r * r) edits[y * W + x] = val;
+  }
+}
+/* ---------- Smart erase ----------
+   Inside the brush, a pixel is removed only if its colour is close to the background and closer to the background
+   than to the object. Background colours: the colour under the brush centre where the stroke starts, plus nearby
+   pixels that are already removed. Object colours: nearby pixels that are already kept. Resampled as the brush moves. */
+let cap = null, colCache = null, colFor = null, smart = null;
+function colours() {
+  if (colCache && colFor === src && colCache.length === W * H * 3) return colCache;
+  // lightly smoothed (3x3), so camera grain and JPEG noise don't leave speckles
+  const px = flatten(W, H), N = W * H, ch = new Float32Array(N); colCache = new Float32Array(N * 3);
+  for (let j = 0; j < 3; j++) { for (let i = 0; i < N; i++) ch[i] = px[i * 4 + j] / 255; const b = boxMean(ch, W, H, 1); for (let i = 0; i < N; i++) colCache[i * 3 + j] = b[i]; }
+  colFor = src; return colCache;
+}
+function smartSample(cx, cy, withCentre) {
+  const col = colours(), a = alphaImg.data, r = brushRadius(), R = Math.max(8, r * 3), step = Math.max(1, Math.floor(R / 12));
+  const bgR = [], fgR = [];
+  for (let y = Math.max(0, Math.round(cy - R)); y <= Math.min(H - 1, Math.round(cy + R)); y += step)
+    for (let x = Math.max(0, Math.round(cx - R)); x <= Math.min(W - 1, Math.round(cx + R)); x += step) {
+      if ((x - cx) ** 2 + (y - cy) ** 2 > R * R) continue;
+      const i = y * W + x, al = a[i * 4 + 3];
+      if (al < 25) bgR.push(i); else if (al > 230 && (x - cx) ** 2 + (y - cy) ** 2 > r * r) fgR.push(i);  // object colours from outside the brush
+    }
+  const pick = (list, n) => { const out = []; const s = Math.max(1, Math.floor(list.length / n)); for (let k = 0; k < list.length && out.length < n; k += s) out.push([col[list[k] * 3], col[list[k] * 3 + 1], col[list[k] * 3 + 2]]); return out; };
+  if (withCentre || !smart) {
+    let n = 0; const c = [0, 0, 0];
+    for (let y = Math.max(0, Math.round(cy) - 2); y <= Math.min(H - 1, Math.round(cy) + 2); y++) for (let x = Math.max(0, Math.round(cx) - 2); x <= Math.min(W - 1, Math.round(cx) + 2); x++) { const i = y * W + x; for (let j = 0; j < 3; j++) c[j] += col[i * 3 + j]; n++; }
+    smart = { centre: c.map(v => v / n) };
+  }
+  smart.bg = [smart.centre, ...pick(bgR, 48)]; smart.fg = pick(fgR, 48); smart.at = { x: cx, y: cy };
+}
+function smartDab(cx, cy) {
+  const col = colours(), r = brushRadius(), tol = .02 + +$('sens').value / 100 * .28, lo = tol * .7;
+  const near = (refs, c) => { let m = Infinity; for (const q of refs) { const d = (c[0] - q[0]) ** 2 + (c[1] - q[1]) ** 2 + (c[2] - q[2]) ** 2; if (d < m) m = d; } return Math.sqrt(m); };
+  const c = [0, 0, 0];
+  for (let y = Math.max(0, Math.floor(cy - r)); y <= Math.min(H - 1, Math.ceil(cy + r)); y++)
+    for (let x = Math.max(0, Math.floor(cx - r)); x <= Math.min(W - 1, Math.ceil(cx + r)); x++) {
+      if ((x - cx) ** 2 + (y - cy) ** 2 > r * r) continue;
+      const i = y * W + x; c[0] = col[i * 3]; c[1] = col[i * 3 + 1]; c[2] = col[i * 3 + 2];
+      const dbg = near(smart.bg, c); if (dbg >= tol) continue;
+      const dfg = near(smart.fg, c); if (dfg <= dbg) continue;
+      const t = Math.min(1, Math.max(0, (dbg - lo) / (tol - lo))), v = t * t * (3 - 2 * t);
+      if (v < cap[i]) { cap[i] = v; if (edits[i] === 2) edits[i] = 0; }
+    }
+}
+function smartLine(a, b) {
+  const r = brushRadius(), dist = Math.hypot(b.x - a.x, b.y - a.y), steps = Math.max(1, Math.ceil(dist / Math.max(1, r / 3)));
+  for (let s = 0; s <= steps; s++) {
+    const cx = a.x + (b.x - a.x) * s / steps, cy = a.y + (b.y - a.y) * s / steps;
+    if (Math.hypot(cx - smart.at.x, cy - smart.at.y) > r) smartSample(cx, cy, false);
+    smartDab(cx, cy);
   }
 }
 function toMask(e) {
@@ -814,7 +876,9 @@ stage.addEventListener('pointerdown', e => {
   if (tool === 'compare') { split = Math.min(1, Math.max(0, p.f)); setSplitUI(); render(); return; }
   if (tool === 'select') { drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y }; return; }
   pushUndo();
-  last = p; hover = p; paintLine(p, p, tool === 'erase' ? 1 : 2); queue(updateAlpha);
+  last = p; hover = p;
+  if (tool === 'smart') { smart = null; smartSample(p.x, p.y, true); smartDab(p.x, p.y); } else paintLine(p, p, tool === 'erase' ? 1 : 2);
+  queue(updateAlpha);
 });
 stage.addEventListener('pointermove', e => {
   if (!src) return;
@@ -822,7 +886,7 @@ stage.addEventListener('pointermove', e => {
   if (tool === 'compare') { if (dragging) { split = Math.min(1, Math.max(0, p.f)); setSplitUI(); queue(render); } return; }
   if (tool === 'select') { if (dragging && drag) { drag.x1 = p.x; drag.y1 = p.y; queue(render); } return; }
   hover = p;
-  if (dragging && last) { paintLine(last, p, tool === 'erase' ? 1 : 2); last = p; queue(updateAlpha); } else queue(render);
+  if (dragging && last) { if (tool === 'smart') smartLine(last, p); else paintLine(last, p, tool === 'erase' ? 1 : 2); last = p; queue(updateAlpha); } else queue(render);
 });
 const endStroke = () => { dragging = false; last = null; if (drag) { drag = null; queue(render); } };
 stage.addEventListener('pointerup', e => {
@@ -843,7 +907,8 @@ stage.addEventListener('pointerup', e => {
 stage.addEventListener('pointercancel', endStroke);
 stage.addEventListener('pointerleave', () => { hover = null; if (src) queue(render); });
 
-for (const t of ['compare', 'erase', 'restore', 'select']) $('t-' + t).onclick = () => setTool(t);
+for (const t of ['compare', 'erase', 'smart', 'restore', 'select']) $('t-' + t).onclick = () => setTool(t);
+$('sens').oninput = e => { $('sens-out').textContent = e.target.value; }; $('sens-out').textContent = $('sens').value;
 for (const m of ['add', 'remove']) $('sm-' + m).onclick = () => { selMode = m; $('sm-add').setAttribute('aria-pressed', m === 'add'); $('sm-remove').setAttribute('aria-pressed', m === 'remove'); };
 $('split').oninput = e => { split = e.target.value / 100; setSplitUI(); render(); };
 $('brush').oninput = e => { $('brush-out').textContent = e.target.value + '%'; };
@@ -859,8 +924,8 @@ for (const m of ['auto', 'on', 'off']) $('fb-' + m).onclick = () => {
 $('gaps').oninput = () => { $('gaps-out').textContent = +$('gaps').value ? '…' : 'off'; };
 $('gaps').onchange = () => { if (!src || !$('busy').hidden) return; computeGaps(); $('gaps-note').textContent = gapInfo || $('gaps-note').dataset.base; updateAlpha(); };
 $('gaps-out').textContent = 'standard';
-$('undo').onclick = () => { if (undoStack.length) { const u = undoStack.pop(); edits = u.edits; raw = u.raw; sel = u.sel; gap = u.gap; syncEditButtons(); updateAlpha(); } };
-$('reset').onclick = () => { undoStack = []; edits.fill(0); syncEditButtons(); updateAlpha(); };
+$('undo').onclick = () => { if (undoStack.length) { const u = undoStack.pop(); edits = u.edits; raw = u.raw; sel = u.sel; gap = u.gap; cap = u.cap; syncEditButtons(); updateAlpha(); } };
+$('reset').onclick = () => { undoStack = []; edits.fill(0); cap.fill(1); syncEditButtons(); updateAlpha(); };
 
 function setBg(val, el) {
   bg = val;

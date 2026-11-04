@@ -159,24 +159,6 @@ kbd { font: .85em var(--mono); border: 1px solid var(--line); border-bottom-widt
         <input type="range" id="cutoff" min="15" max="85" value="50">
         <div class="ends"><span>Keep more</span><span>Keep less</span></div>
       </div>
-      <div class="slider">
-        <label for="soft">Edge softness</label>
-        <input type="range" id="soft" min="2" max="50" value="15">
-        <div class="ends"><span>Crisp</span><span>Soft</span></div>
-      </div>
-      <div style="display:grid;gap:6px">
-        <span style="font-size:.92rem">Flat background <output id="fb-out" style="font:.8rem var(--mono);color:var(--muted)"></output></span>
-        <div class="seg" role="group" aria-label="Flat background">
-          <button id="fb-auto" aria-pressed="true">Auto</button><button id="fb-on" aria-pressed="false">On</button><button id="fb-off" aria-pressed="false">Off</button>
-        </div>
-        <p class="hint">For screenshots, mood boards and graphics on one flat colour: removes that colour wherever it touches the edge, keeping every item and caption crisp.</p>
-      </div>
-      <div class="slider">
-        <label for="gaps">See-through gaps <output id="gaps-out"></output></label>
-        <input type="range" id="gaps" min="0" max="100" value="50">
-        <div class="ends"><span>Off</span><span>Open more</span></div>
-      </div>
-      <p class="hint" id="gaps-note">For wicker, rattan, cane and lattice on a plain background: clears the background showing through the weave.</p>
     </div>
 
     <div class="group">
@@ -255,7 +237,7 @@ function setSource(canvas, label) {
   const pw = Math.max(1, Math.round(src.width * ps)), ph = Math.max(1, Math.round(src.height * ps));
   stage.width = pw; stage.height = ph; cutCv = newCanvas(pw, ph); previewCv = newCanvas(pw, ph);
   const p = previewCv.getContext('2d'); p.imageSmoothingQuality = 'high'; p.drawImage(src, 0, 0, pw, ph);
-  edits = new Int8Array(W * H); cap = new Float32Array(W * H).fill(1); undoStack = []; gap = null; sel = null; drag = null; modelRaw = null; bdAlpha = null; $('fb-out').textContent = ''; syncEditButtons(); fit();
+  edits = new Int8Array(W * H); cap = new Float32Array(W * H).fill(1); undoStack = []; gap = null; sel = null; drag = null; modelRaw = null; bdAlpha = null; syncEditButtons(); fit();
 }
 
 async function openFile(file, label) {
@@ -299,12 +281,12 @@ async function cut(id) {
     if (id !== runId) return;
     modelRaw = raw.slice();
     busy('Checking the background…'); await nextPaint();
-    if (bdMode !== 'off') { raw = modelRaw.slice(); computeBackdrop(); if (bdAlpha) raw = bdAlpha.slice(); }
-    busy('Looking for see-through gaps…'); await nextPaint(); computeGaps(); $('gaps-note').textContent = gapInfo || $('gaps-note').dataset.base;
+    computeBackdrop(); if (bdAlpha) raw = bdAlpha.slice();
+    busy('Looking for see-through gaps…'); await nextPaint(); computeGaps();
     sel = null; split = 0; setSplitUI(); updateAlpha();
     let total = 0; for (let i = 0; i < raw.length; i++) total += raw[i];
     if (total / raw.length < 0.01) say('No clear subject was found. Use Restore to paint back what you want to keep, or try a photo with one main subject.', true);
-    else say(`Done${useBig ? ' (best quality)' : ''}. ${sizeNote}Wrong piece, or part of the room left in? Choose Select and drag a box around the piece you want.`);
+    else say(`Done${useBig ? ' (best quality)' : ''}. ${bdAlpha ? 'Flat background removed by colour. ' : ''}${gap ? gapInfo + ' ' : ''}${sizeNote}Wrong piece, or part of the room left in? Choose Select and drag a box around the piece you want.`);
   } catch (e) {
     console.error(e);
     if (id !== runId) return;
@@ -475,7 +457,7 @@ async function runSelect() {
     for (let i = 0; i < gray.length; i++) gray[i] = (col[i * 4] * .299 + col[i * 4 + 1] * .587 + col[i * 4 + 2] * .114) / 255;
     raw = guidedFilter(gray, p, W, H, Math.max(2, Math.round(Math.max(W, H) / 200)), 0.001);
     if (bdAlpha) for (let i = 0; i < raw.length; i++) raw[i] = Math.min(raw[i], bdAlpha[i]);
-    edits.fill(0); computeGaps(); $('gaps-note').textContent = gapInfo || $('gaps-note').dataset.base; split = 0; setSplitUI(); updateAlpha();
+    edits.fill(0); computeGaps(); split = 0; setSplitUI(); updateAlpha();
     let total = 0; for (let i = 0; i < raw.length; i++) total += raw[i] > .5;
     say(total < raw.length * 0.002 ? 'Nothing was selected there. Try a box that fits snugly around the piece.' :
       'Selected. Tap to add anything it missed; switch to Tap removes for anything it wrongly kept. Undo steps back.', total < raw.length * 0.002);
@@ -578,10 +560,10 @@ function smoothBackground(rgb, bgw, w, h) {
    colour are removed where the model agrees). Auto only switches on when the edges are at least 90% backdrop, the
    backdrop is very smooth and it covers 75% of the picture, so a white sofa on a white sweep is left to the model.
    Tested on 40 mood boards: overlap 0.81 -> 0.93; on 346 ordinary photos it switched on once, with no change. */
-let modelRaw = null, bdAlpha = null, bdMode = 'auto';
+let modelRaw = null, bdAlpha = null;
 function computeBackdrop() {
-  bdAlpha = null; $('fb-out').textContent = '';
-  if (bdMode === 'off' || !modelRaw) return;
+  bdAlpha = null;
+  if (!modelRaw) return;
   const w = W, h = H, N = w * h, bw = Math.max(2, Math.round(.03 * Math.min(w, h)));
   const px = flatten(w, h), rgb = new Float32Array(N * 3);
   for (let i = 0; i < N; i++) for (let j = 0; j < 3; j++) rgb[i * 3 + j] = px[i * 4 + j] / 255;
@@ -622,8 +604,7 @@ function computeBackdrop() {
   while (sp) { const q = stack[--sp], x = q % w; cover++;
     for (const r of [x > 0 ? q - 1 : -1, x < w - 1 ? q + 1 : -1, q - w, q + w]) if (r >= 0 && r < N && !region[r] && pass[r]) { region[r] = 1; stack[sp++] = r; } }
   cover /= N;
-  const ok = bdMode === 'on' ? cover > .02 : plain <= .005 && ringP / ringN >= .9 && cover >= .75;
-  if (!ok) { if (bdMode === 'on') $('fb-out').textContent = 'no flat colour found'; return; }
+  if (!(plain <= .005 && ringP / ringN >= .9 && cover >= .75)) return;
   let band = region.slice();
   for (let it = 0; it < 2; it++) { const nb = band.slice();
     for (let i = 0; i < N; i++) if (band[i]) { const x = i % w; if (x > 0) nb[i - 1] = 1; if (x < w - 1) nb[i + 1] = 1; if (i >= w) nb[i - w] = 1; if (i + w < N) nb[i + w] = 1; }
@@ -636,11 +617,10 @@ function computeBackdrop() {
     if (region[i] && shadow[i]) v = Math.min(v, a[i]);
     bdAlpha[i] = v;
   }
-  $('fb-out').textContent = 'removed by colour';
 }
 function computeGaps() {
   gap = null; gapInfo = '';
-  const strength = +$('gaps').value; $('gaps-out').textContent = strength ? (strength === 50 ? 'standard' : strength < 50 ? 'gentle' : 'strong') : 'off';
+  const strength = 50;  // the tested setting
   if (!strength || !raw) return;
   const f = Math.pow(2, (strength - 50) / 50), w = W, h = H, N = w * h;
   const cut = .5, sf = .15, a = new Float32Array(N), bgw = new Float32Array(N);
@@ -712,7 +692,7 @@ function computeGaps() {
 
 /* ---------- Mask and drawing ---------- */
 function updateAlpha() {
-  const c = +$('cutoff').value / 100, s = +$('soft').value / 100, lo = c - s, k = 1 / (2 * s), a = alphaImg.data;
+  const c = +$('cutoff').value / 100, s = .15, lo = c - s, k = 1 / (2 * s), a = alphaImg.data;  // softness fixed at the tested best
   for (let i = 0; i < raw.length; i++) {
     let v;
     if (edits[i] === 1) v = 0; else if (edits[i] === 2) v = 1;
@@ -913,17 +893,7 @@ for (const m of ['add', 'remove']) $('sm-' + m).onclick = () => { selMode = m; $
 $('split').oninput = e => { split = e.target.value / 100; setSplitUI(); render(); };
 $('brush').oninput = e => { $('brush-out').textContent = e.target.value + '%'; };
 $('brush-out').textContent = $('brush').value + '%';
-$('cutoff').oninput = $('soft').oninput = () => queue(updateAlpha);
-$('gaps-note').dataset.base = $('gaps-note').textContent;
-for (const m of ['auto', 'on', 'off']) $('fb-' + m).onclick = () => {
-  bdMode = m; for (const k of ['auto', 'on', 'off']) $('fb-' + k).setAttribute('aria-pressed', k === m);
-  if (!src || !modelRaw || !$('busy').hidden) return;
-  pushUndo(); sel = null; raw = modelRaw.slice(); computeBackdrop(); if (bdAlpha) raw = bdAlpha.slice();
-  computeGaps(); $('gaps-note').textContent = gapInfo || $('gaps-note').dataset.base; updateAlpha();
-};
-$('gaps').oninput = () => { $('gaps-out').textContent = +$('gaps').value ? '…' : 'off'; };
-$('gaps').onchange = () => { if (!src || !$('busy').hidden) return; computeGaps(); $('gaps-note').textContent = gapInfo || $('gaps-note').dataset.base; updateAlpha(); };
-$('gaps-out').textContent = 'standard';
+$('cutoff').oninput = () => queue(updateAlpha);
 $('undo').onclick = () => { if (undoStack.length) { const u = undoStack.pop(); edits = u.edits; raw = u.raw; sel = u.sel; gap = u.gap; cap = u.cap; syncEditButtons(); updateAlpha(); } };
 $('reset').onclick = () => { undoStack = []; edits.fill(0); cap.fill(1); syncEditButtons(); updateAlpha(); };
 

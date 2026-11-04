@@ -250,8 +250,18 @@ async function openFile(file, label) {
   const c = newCanvas(Math.round(bmp.naturalWidth * s), Math.round(bmp.naturalHeight * s));
   const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(bmp, 0, 0, c.width, c.height);
   setSource(c, label || (file.name || 'photo').replace(/\.[^.]+$/, '') || 'photo');
-  raw = new Float32Array(W * H).fill(1); split = 1; setSplitUI(); updateAlpha();
   isExample = false;
+  /* Already cut out (for example a subject lifted on an iPhone and pasted here): keep its own transparency. */
+  const ac = newCanvas(W, H), ax = ac.getContext('2d', { willReadFrequently: true }); ax.drawImage(c, 0, 0, W, H);
+  const ad = ax.getImageData(0, 0, W, H).data; let clear = 0;
+  for (let i = 3; i < ad.length; i += 4) clear += ad[i] < 128;
+  if (clear > W * H * .02) {
+    raw = new Float32Array(W * H); for (let i = 0; i < raw.length; i++) raw[i] = ad[i * 4 + 3] / 255;
+    split = 0; setSplitUI(); updateAlpha();
+    say('This picture already has a transparent background, so it was kept as it is. Pick a background colour, then Copy or Save.');
+    return;
+  }
+  raw = new Float32Array(W * H).fill(1); split = 1; setSplitUI(); updateAlpha();
   sizeNote = s < 1 ? `Saved size is limited to ${c.width} × ${c.height} px. ` : '';
   await cut(id);
 }
@@ -373,52 +383,10 @@ async function removeBackground(id) {
   bx.imageSmoothingQuality = 'high'; bx.drawImage(small, 0, 0, W, H);
   const up = bx.getImageData(0, 0, W, H).data, p = new Float32Array(W * H);
   for (let i = 0; i < p.length; i++) p[i] = up[i * 4] / 255;
-  busy('Firming up the cutout…'); await nextPaint();
-  const firm = await firmUp(p);
-  if (id !== runId) return;
   busy('Cleaning up the edges…'); await nextPaint();
   const col = flatten(W, H), gray = new Float32Array(W * H);
   for (let i = 0; i < gray.length; i++) gray[i] = (col[i * 4] * .299 + col[i * 4 + 1] * .587 + col[i * 4 + 2] * .114) / 255;
-  raw = guidedFilter(gray, firm, W, H, Math.max(3, Math.round(Math.max(W, H) / 90)), 0.002);
-}
-
-/* ---------- Firm up: GrabCut (OpenCV, Apache-2.0) ----------
-   Where the model is unsure it outputs in-between values, which show as a see-through, ghostly cutout. GrabCut takes
-   the model's confident areas as a starting point, learns the colours of the piece and of the background, and
-   decides each unsure pixel while keeping the piece in one connected shape. */
-let cvReady = null;
-function loadCV() {
-  if (!cvReady) cvReady = new Promise((res, rej) => {
-    const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.12.0-release.1/dist/opencv.js'; s.async = true;
-    s.onload = async () => { try { let c = window.cv; if (c instanceof Promise) c = await c; else if (c && !c.Mat) await new Promise(r => { c.onRuntimeInitialized = r; }); window.cv = c; res(c); } catch (e) { rej(e); } };
-    s.onerror = () => rej(new Error('opencv did not load'));
-    document.head.append(s);
-  }).catch(e => { cvReady = null; throw e; });
-  return cvReady;
-}
-async function firmUp(p) {
-  let cv; try { cv = await loadCV(); } catch (e) { console.warn(e); return p; }
-  const k = Math.min(1, 512 / Math.max(W, H)), sw = Math.max(1, Math.round(W * k)), sh = Math.max(1, Math.round(H * k));
-  const px = flatten(sw, sh), img = new cv.Mat(sh, sw, cv.CV_8UC3), m = new cv.Mat(sh, sw, cv.CV_8UC1), bgd = new cv.Mat(), fgd = new cv.Mat();
-  try {
-    let sure = 0, gone = 0;
-    for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
-      const i = y * sw + x, v = p[Math.min(H - 1, Math.round((y + .5) / k - .5)) * W + Math.min(W - 1, Math.round((x + .5) / k - .5))];
-      for (let j = 0; j < 3; j++) img.data[i * 3 + j] = px[i * 4 + j];
-      m.data[i] = v > .95 ? 1 : v < .05 ? 0 : v >= .5 ? 3 : 2; sure += v > .95; gone += v < .05;
-    }
-    if (!sure || !gone) return p;
-    cv.grabCut(img, m, new cv.Rect(0, 0, 1, 1), bgd, fgd, 4, cv.GC_INIT_WITH_MASK);
-    const r = new Float32Array(W * H);
-    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {  // bilinear back up to mask size
-      const fx = Math.min(sw - 1, Math.max(0, (x + .5) * k - .5)), fy = Math.min(sh - 1, Math.max(0, (y + .5) * k - .5)), x0 = fx | 0, y0 = fy | 0;
-      const x1 = Math.min(sw - 1, x0 + 1), y1 = Math.min(sh - 1, y0 + 1), ax = fx - x0, ay = fy - y0, g = (yy, xx) => m.data[yy * sw + xx] & 1;
-      r[y * W + x] = (g(y0, x0) * (1 - ax) + g(y0, x1) * ax) * (1 - ay) + (g(y1, x0) * (1 - ax) + g(y1, x1) * ax) * ay;
-    }
-    return r;
-  } catch (e) { console.warn(e); return p; }
-  finally { img.delete(); m.delete(); bgd.delete(); fgd.delete(); }
+  raw = guidedFilter(gray, p, W, H, Math.max(3, Math.round(Math.max(W, H) / 90)), 0.002);
 }
 
 /* Box mean over a (2r+1) window, shrinking at the borders. */
